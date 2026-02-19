@@ -40,7 +40,7 @@ from engine.pipeline import apply_choice, apply_option_spec, draft_to_bundle, in
 APP_TITLE = "Startup Survivor RPG"
 APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. (LLM içerik + deterministik ekonomi)"
 APP_VERSION = "3.2.1"
-BUILD_ID = "v11-core-bootstrap-20260219"
+BUILD_ID = "v11.2-core-bootstrap-20260219"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
@@ -105,10 +105,21 @@ def bootstrap_core_or_stop() -> None:
         )
         st.stop()
 
-    if not hasattr(_Stats, "morale") or not hasattr(_Stats, "tech_debt"):
+    # Validate expected Stats fields (dataclass fields live on instances, not the class).
+    fields = set()
+    fields.update(getattr(_Stats, '__annotations__', {}).keys())
+    fields.update(getattr(getattr(_Stats, '__dataclass_fields__', {}), 'keys', lambda: [])())
+
+    missing = [k for k in ('morale', 'tech_debt') if k not in fields]
+    if missing:
+        import core.state as _cs
         st.error(
-            "Core Stats alanları eksik görünüyor (morale/tech_debt).\n\n"
-            "Çözüm: Zip içindeki TÜM dosyaları overwrite edip deploy et."
+            'Core Stats alanları eksik görünüyor (morale/tech_debt).\n\n'
+            'Bu genelde repo kısmi güncellendiğinde veya yanlış 'core' paketi import edildiğinde olur.\n\n'
+            f'Yüklenen core.state yolu: {_cs.__file__}\n'
+            f'Bulunan alanlar: {sorted(fields)}\n'
+            f'Eksik: {missing}\n\n'
+            'Çözüm: Zip içindeki TÜM dosyaları repo köküne overwrite edip tekrar deploy et (ve Cloud'da Reboot/Clear cache).'
         )
         st.stop()
 
