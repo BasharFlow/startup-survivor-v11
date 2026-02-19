@@ -114,12 +114,12 @@ def bootstrap_core_or_stop() -> None:
     if missing:
         import core.state as _cs
         st.error(
-            'Core Stats alanları eksik görünüyor (morale/tech_debt).\n\n'
-            'Bu genelde repo kısmi güncellendiğinde veya yanlış 'core' paketi import edildiğinde olur.\n\n'
-            f'Yüklenen core.state yolu: {_cs.__file__}\n'
-            f'Bulunan alanlar: {sorted(fields)}\n'
-            f'Eksik: {missing}\n\n'
-            'Çözüm: Zip içindeki TÜM dosyaları repo köküne overwrite edip tekrar deploy et (ve Cloud'da Reboot/Clear cache).'
+            "Core Stats alanları eksik görünüyor (morale/tech_debt).\n\n"
+            "Bu genelde repo kısmi güncellendiğinde veya yanlış 'core' paketi import edildiğinde olur.\n\n"
+            f"Yüklenen core.state yolu: {_cs.__file__}\n"
+            f"Bulunan alanlar: {sorted(fields)}\n"
+            f"Eksik: {missing}\n\n"
+            "Çözüm: Zip içindeki TÜM dosyaları repo köküne overwrite edip tekrar deploy et (ve Cloud'da Reboot/Clear cache)."
         )
         st.stop()
 
