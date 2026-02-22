@@ -12,12 +12,22 @@ Secrets/env loading is done in the Streamlit app.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import re
+import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..parsing import try_parse_json
 from ..schemas import MonthDraft, ChoiceIntent, draft_from_llm, intent_from_llm, validate_intent
 from .base import ProviderStatus
+
+
+class RateLimitError(RuntimeError):
+    """Raised when the API returns a rate/quota error (HTTP 429 RESOURCE_EXHAUSTED)."""
+
+    def __init__(self, message: str, retry_after_s: int = 0) -> None:
+        super().__init__(message)
+        self.retry_after_s = int(retry_after_s or 0)
 
 
 @dataclass
@@ -32,6 +42,10 @@ class GeminiProvider:
     _client: Any = None
     _legacy: Any = None
 
+    # key health
+    _cooldown_until: Dict[str, float] = field(default_factory=dict)  # key -> epoch seconds
+    _dead_keys: set[str] = field(default_factory=set)
+
     def __post_init__(self) -> None:
         self.api_keys = [k.strip() for k in (self.api_keys or []) if str(k).strip()]
         self._init_backend()
@@ -40,8 +54,9 @@ class GeminiProvider:
     def from_api_key_string(raw: str) -> "GeminiProvider":
         if not raw:
             return GeminiProvider([])
-        raw = str(raw)
-        keys = [x.strip() for x in raw.split(",") if x.strip()] if "," in raw else [raw.strip()]
+        raw = str(raw).strip()
+        # allow comma-separated list in a single secret (GEMINI_API_KEY="k1,k2,k3")
+        keys = [x.strip() for x in raw.split(",") if x.strip()] if "," in raw else [raw]
         return GeminiProvider(keys)
 
     def _init_backend(self) -> None:
@@ -50,8 +65,10 @@ class GeminiProvider:
         self.backend = "none"
         self.model_in_use = ""
 
+        self.api_keys = [k for k in self.api_keys if k and k not in self._dead_keys]
+
         if not self.api_keys:
-            self.last_error = "API key yok."
+            self.last_error = "API key yok (veya tüm key'ler devre dışı)."
             return
 
         # Try new SDK: google-genai
@@ -118,21 +135,62 @@ class GeminiProvider:
             or "429" in s
         )
 
+    @staticmethod
+    def _retry_after_seconds_from_error_text(msg: str) -> int:
+        """Best-effort parse of retry delay from SDK/HTTP error strings."""
+        if not msg:
+            return 0
+        # common patterns: retryDelaySeconds: 16  OR retryDelay: '16s'
+        m = re.search(r"retryDelaySeconds\D+(\d+)", msg)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"retryDelay\D+([0-9]+)s", msg)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"retry_after\D+(\d+)", msg, flags=re.I)
+        if m:
+            return int(m.group(1))
+        return 0
+
+    @staticmethod
+    def _has_limit_zero(msg: str) -> bool:
+        return "limit:0" in (msg or "").replace(" ", "").lower()
+
+    def _skip_key_if_cooldown(self) -> bool:
+        """Rotate away if current key is cooling down. Returns True if rotated."""
+        if not self.api_keys:
+            return False
+        k = self.api_keys[0]
+        until = float(self._cooldown_until.get(k, 0.0) or 0.0)
+        if until and time.time() < until:
+            self._rotate_key()
+            return True
+        return False
+
     def _generate_text(self, prompt: str, temperature: float, max_output_tokens: int) -> str:
+        # Prefer newest stable models first to avoid accidentally hitting models that have 0 quota in your tier.
         candidates = [
-            "gemini-1.5-flash",
-            "gemini-1.5-pro",
-            "gemini-2.0-flash",
-            "gemini-2.5-flash",
             "gemini-2.5-pro",
+            "gemini-2.5-flash",
             "gemini-2.5-pro-latest",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
         ]
 
         last_err: Optional[Exception] = None
+        last_retry_after: int = 0
+        now = time.time()
 
         # Iterate keys (pool). We rotate on certain errors, and also rotate on success
         # so that load is distributed across the pool when this provider instance is reused.
         for _ in range(max(1, len(self.api_keys))):
+            # skip keys currently in cooldown window
+            if self._skip_key_if_cooldown():
+                continue
+
+            current_key = self.api_keys[0] if self.api_keys else ""
+
             if self.backend == "genai" and self._client is not None:
                 for m in candidates:
                     try:
@@ -156,9 +214,30 @@ class GeminiProvider:
                             return txt
                     except Exception as e:
                         last_err = e
-                        # If key is invalid or quota is hit, don't waste time trying other models.
-                        if self._is_key_invalid(e) or self._is_rate_or_quota(e):
+                        msg = self._err_text(e)
+                        # Key invalid => mark dead and move on quickly.
+                        if self._is_key_invalid(e):
+                            self._dead_keys.add(current_key)
+                            self._init_backend()
                             break
+
+                        # Quota / rate limit handling:
+                        if self._is_rate_or_quota(e):
+                            delay = self._retry_after_seconds_from_error_text(msg)
+                            last_retry_after = max(last_retry_after, delay)
+                            # If this key's project has limit 0 for the model/tier, it's effectively unusable.
+                            if self._has_limit_zero(msg):
+                                self._dead_keys.add(current_key)
+                                self._init_backend()
+                                break
+                            # If server told us to wait, put this key on cooldown and rotate.
+                            if delay >= 1:
+                                self._cooldown_until[current_key] = now + float(delay)
+                                break
+                            # Otherwise, try next model with same key (some models may still be available).
+                            continue
+
+                        # other errors: try next model
                         continue
 
             if self.backend == "legacy" and self._legacy is not None:
@@ -189,12 +268,34 @@ class GeminiProvider:
                             return txt
                     except Exception as e:
                         last_err = e
-                        if self._is_key_invalid(e) or self._is_rate_or_quota(e):
+                        msg = self._err_text(e)
+                        if self._is_key_invalid(e):
+                            self._dead_keys.add(current_key)
+                            self._init_backend()
                             break
+                        if self._is_rate_or_quota(e):
+                            delay = self._retry_after_seconds_from_error_text(msg)
+                            last_retry_after = max(last_retry_after, delay)
+                            if self._has_limit_zero(msg):
+                                self._dead_keys.add(current_key)
+                                self._init_backend()
+                                break
+                            if delay >= 1:
+                                self._cooldown_until[current_key] = now + float(delay)
+                                break
+                            continue
                         continue
 
+            # rotate key for next outer attempt
             self._rotate_key()
 
+        # If we land here, nothing worked.
+        if last_err and self._is_rate_or_quota(last_err):
+            raise RateLimitError(
+                f"Gemini kota/rate limit aşıldı (429 RESOURCE_EXHAUSTED)."
+                + (f" {last_retry_after}s sonra tekrar dene." if last_retry_after else ""),
+                retry_after_s=last_retry_after,
+            )
         raise RuntimeError(f"Gemini hata: {last_err}" if last_err else "Gemini yanıt veremedi.")
 
     def _parse_or_raise(self, raw: str) -> Dict[str, Any]:
@@ -223,15 +324,12 @@ class GeminiProvider:
 
         Strategy:
         1) Try main prompt.
-        2) If parse/validation fails and repair_on_fail is True, run one repair pass.
+        2) If parse/validation fails and repair_on_fail is True, run repair/expand passes.
         """
         raw = self._generate_text(prompt, temperature=temperature, max_output_tokens=max_output_tokens)
         data: Optional[Dict[str, Any]] = None
         try:
             data = self._parse_or_raise(raw)
-            # month_id is supplied by the caller (engine/UI) and validated in draft_from_llm_v1.
-            # draft_from_llm_v1 validates minimum lengths/steps and normalizes tag/risk.
-            # (No placeholder; we use the provided month_id.)
             draft = draft_from_llm(data, month_id=int(month_id))
             return draft, raw
         except Exception as e:
@@ -295,7 +393,8 @@ class GeminiProvider:
                     # Pass 3: regenerate from scratch with strict length requirements appended
                     strict_prompt = (
                         prompt
-                        + "\n\nEK KURAL (kritik): durum_analizi ve kriz en az 450 karakter; result en az 200 karakter; steps en az 4 madde.\n"                        + "SADECE JSON döndür, markdown yok. Kısa yazma."
+                        + "\n\nEK KURAL (kritik): durum_analizi ve kriz en az 450 karakter; result en az 200 karakter; steps en az 4 madde.\n"
+                        + "SADECE JSON döndür, markdown yok. Kısa yazma."
                     )
                     raw3 = self._generate_text(
                         strict_prompt,
@@ -310,8 +409,10 @@ class GeminiProvider:
 
                 # If we are here, all enrichment attempts failed. Don't run generic JSON-repair; it won't fix short content.
                 raise RuntimeError(self.last_error or "Gemini çıktı çok kısa kaldı (auto-expand başarısız).")
+
         if repair_on_fail:
             from ..prompts import build_json_repair_prompt
+
             repair_prompt = build_json_repair_prompt(raw)
             raw2 = self._generate_text(repair_prompt, temperature=0.1, max_output_tokens=max_output_tokens + 300)
             data2 = self._parse_or_raise(raw2)
@@ -319,7 +420,6 @@ class GeminiProvider:
             return draft2, raw2
 
         raise RuntimeError(self.last_error or "Gemini çıktı doğrulanamadı")
-
 
     def generate_choice_intent(
         self,
@@ -329,12 +429,7 @@ class GeminiProvider:
         max_output_tokens: int = 1200,
         repair_on_fail: bool = True,
     ) -> Tuple[ChoiceIntent, str]:
-        """Generate and validate ChoiceIntent (player custom plan).
-
-        Strategy:
-        1) Try main prompt.
-        2) If parse/validation fails and repair_on_fail is True, run one repair pass.
-        """
+        """Generate and validate ChoiceIntent (player custom plan)."""
         raw = self._generate_text(prompt, temperature=temperature, max_output_tokens=max_output_tokens)
         try:
             data = self._parse_or_raise(raw)

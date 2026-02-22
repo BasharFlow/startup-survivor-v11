@@ -30,7 +30,7 @@ stats_to_dict = default_start_state = None  # type: ignore
 
 
 from content.prompts import build_prompt, build_choice_intent_prompt
-from content.providers.gemini import GeminiProvider
+from content.providers.gemini import GeminiProvider, RateLimitError
 from content.providers.base import ProviderStatus
 
 from engine.config import EngineConfig
@@ -40,7 +40,7 @@ from engine.pipeline import apply_choice, apply_option_spec, draft_to_bundle, in
 APP_TITLE = "Startup Survivor RPG"
 APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. (LLM içerik + deterministik ekonomi)"
 APP_VERSION = "3.2.1"
-BUILD_ID = "v11.7-minlen-autofix-20260222"
+BUILD_ID = "v11.8-quota-smartpool-20260222"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
@@ -1034,12 +1034,28 @@ def main() -> None:
         try:
             page_run()
         except Exception as e:
-            st.error(f"Sistem şu an cevap veremiyor: {e}")
-            if 'API_KEY_INVALID' in str(e) or 'API key not valid' in str(e):
+            # Friendlier handling for rate limits / quota exhaustion
+            if isinstance(e, RateLimitError):
+                delay = int(getattr(e, "retry_after_s", 0) or 0)
+                msg = str(e)
+                if delay > 0:
+                    st.error(f"Sistem şu an cevap veremiyor: {msg}\n\n⏳ Öneri: {delay} saniye bekleyip tekrar dene.")
+                else:
+                    st.error(f"Sistem şu an cevap veremiyor: {msg}")
                 st.info(
-                    "API key geçersiz görünüyor. Kontrol listesi: (1) Streamlit Secrets'te doğru anahtar mı? (2) Anahtarda kopyalama sırasında boşluk/newline var mı? (3) Google Cloud API Key restriction (HTTP referrer / IP) açıksa kaldır. (4) Doğru servis: Google AI Studio / Generative Language API anahtarı."
+                    "Not: Gemini rate limit'leri **proje bazlıdır**, API key bazlı değil. Aynı projeden üretilmiş çok key, kota artışı sağlamaz. "
+                    "Key havuzunun işe yaraması için key'lerin farklı projelere (tercihen farklı billing/tier) bağlı olması gerekir."
                 )
-            st.info("Gemini timeout / API hatası olabilir. Debug sayfasından raw output'a bakabilirsin.")
+            else:
+                st.error(f"Sistem şu an cevap veremiyor: {e}")
+                if 'API_KEY_INVALID' in str(e) or 'API key not valid' in str(e):
+                    st.info(
+                        "API key geçersiz görünüyor. Kontrol listesi: (1) Streamlit Secrets'te doğru anahtar mı? "
+                        "(2) Anahtarda kopyalama sırasında boşluk/newline var mı? "
+                        "(3) Google Cloud API Key restriction (HTTP referrer / IP) açıksa kaldır. "
+                        "(4) Doğru servis: Google AI Studio / Generative Language API anahtarı."
+                    )
+                st.info("Gemini timeout / API hatası olabilir. Debug sayfasından raw output'a bakabilirsin.")
             # keep bundle None so user can retry by rerun
             ss.current_bundle = None
     elif page == "Geçmiş":
