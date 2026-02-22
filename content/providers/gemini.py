@@ -244,16 +244,22 @@ class GeminiProvider:
             except Exception:
                 msg = ""
 
-            if repair_on_fail and data is not None and ("too short" in msg or "steps must be" in msg):
+            length_issue = repair_on_fail and data is not None and ("too short" in msg or "steps must be" in msg)
+
+            if length_issue:
+                # JSON parsed but failed our min-length / min-steps constraints. We run up to 3 enrichment passes:
+                #   1) Expand (soft)  2) Expand (hard)  3) Regenerate with stricter constraints
                 try:
                     from ..prompts import build_json_expand_prompt
 
                     canonical = json.dumps(data, ensure_ascii=False, indent=2)
+
+                    # Pass 1: soft expand
                     expand_prompt = build_json_expand_prompt(canonical, reason=msg)
                     raw_expand = self._generate_text(
                         expand_prompt,
                         temperature=0.2,
-                        max_output_tokens=max_output_tokens + 500,
+                        max_output_tokens=max_output_tokens + 800,
                     )
                     data_expand = self._parse_or_raise(raw_expand)
                     draft_expand = draft_from_llm(data_expand, month_id=int(month_id))
@@ -261,6 +267,49 @@ class GeminiProvider:
                 except Exception as e2:
                     self.last_error = f"{type(e2).__name__}: {e2}"
 
+                try:
+                    # Pass 2: hard expand (over-ask so we always clear the threshold)
+                    canonical = json.dumps(data, ensure_ascii=False, indent=2)
+                    hard_prompt = (
+                        "Aşağıdaki JSON geçerli ama içerik KISA kaldı. SADECE geçerli JSON döndür.\n\n"
+                        "ZORUNLU kurallar (aksi halde başarısız):\n"
+                        "- durum_analizi ve kriz: her biri EN AZ 450 karakter, 3-6 paragraf.\n"
+                        "- options: 2 veya 3 adet. Her option steps: 4-6 madde.\n"
+                        "- result: EN AZ 200 karakter, 2-4 kısa paragraf.\n"
+                        "- Şemayı ve alan adlarını KORU. Markdown yok.\n\n"
+                        f"Sebep: {msg}\n\n"
+                        "JSON (genişletilecek):\n" + canonical
+                    )
+                    raw_hard = self._generate_text(
+                        hard_prompt,
+                        temperature=0.15,
+                        max_output_tokens=max_output_tokens + 1200,
+                    )
+                    data_hard = self._parse_or_raise(raw_hard)
+                    draft_hard = draft_from_llm(data_hard, month_id=int(month_id))
+                    return draft_hard, raw_hard
+                except Exception as e3:
+                    self.last_error = f"{type(e3).__name__}: {e3}"
+
+                try:
+                    # Pass 3: regenerate from scratch with strict length requirements appended
+                    strict_prompt = (
+                        prompt
+                        + "\n\nEK KURAL (kritik): durum_analizi ve kriz en az 450 karakter; result en az 200 karakter; steps en az 4 madde.\n"                        + "SADECE JSON döndür, markdown yok. Kısa yazma."
+                    )
+                    raw3 = self._generate_text(
+                        strict_prompt,
+                        temperature=0.25,
+                        max_output_tokens=max_output_tokens + 1200,
+                    )
+                    data3 = self._parse_or_raise(raw3)
+                    draft3 = draft_from_llm(data3, month_id=int(month_id))
+                    return draft3, raw3
+                except Exception as e4:
+                    self.last_error = f"{type(e4).__name__}: {e4}"
+
+                # If we are here, all enrichment attempts failed. Don't run generic JSON-repair; it won't fix short content.
+                raise RuntimeError(self.last_error or "Gemini çıktı çok kısa kaldı (auto-expand başarısız).")
         if repair_on_fail:
             from ..prompts import build_json_repair_prompt
             repair_prompt = build_json_repair_prompt(raw)

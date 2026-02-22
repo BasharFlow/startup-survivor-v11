@@ -40,7 +40,7 @@ from engine.pipeline import apply_choice, apply_option_spec, draft_to_bundle, in
 APP_TITLE = "Startup Survivor RPG"
 APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. (LLM içerik + deterministik ekonomi)"
 APP_VERSION = "3.2.1"
-BUILD_ID = "v11.6-minlen-autoexpand-20260222"
+BUILD_ID = "v11.7-minlen-autofix-20260222"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
