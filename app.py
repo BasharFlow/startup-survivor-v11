@@ -30,7 +30,17 @@ stats_to_dict = default_start_state = None  # type: ignore
 
 
 from content.prompts import build_prompt, build_choice_intent_prompt
-from content.providers.gemini import GeminiProvider, RateLimitError
+try:
+    from content.providers.gemini import GeminiProvider, RateLimitError
+except Exception:
+    # Repo partially updated olabilir: eski gemini.py RateLimitError tanımlamıyor olabilir.
+    from content.providers.gemini import GeminiProvider  # type: ignore
+
+    class RateLimitError(RuntimeError):
+        def __init__(self, message: str, retry_after_s: int = 0) -> None:
+            super().__init__(message)
+            self.retry_after_s = int(retry_after_s or 0)
+
 from content.providers.base import ProviderStatus
 
 from engine.config import EngineConfig
@@ -40,7 +50,7 @@ from engine.pipeline import apply_choice, apply_option_spec, draft_to_bundle, in
 APP_TITLE = "Startup Survivor RPG"
 APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. (LLM içerik + deterministik ekonomi)"
 APP_VERSION = "3.2.1"
-BUILD_ID = "v11.8-quota-smartpool-20260222"
+BUILD_ID = "v11.8.1-import-hotfix-20260222"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
