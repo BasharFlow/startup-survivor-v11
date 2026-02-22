@@ -25,9 +25,19 @@ Bu sürüm **LLM-only** çalışır (offline fallback yok). Devam etmek için Ge
 Streamlit Cloud → App settings → **Secrets** alanına şunu ekle:
 
 ```toml
-GOOGLE_API_KEY = "YOUR_KEY"
-# veya
+# Önerilen: key havuzu (yük paylaşımı + quota fallback)
+GEMINI_API_KEYS = [
+  "YOUR_KEY_1",
+  "YOUR_KEY_2",
+  "YOUR_KEY_3"
+]
+
+# Tek key de olur:
 # GEMINI_API_KEY = "YOUR_KEY"
+
+# Alternatif isimler (desteklenir):
+# GOOGLE_API_KEY = "YOUR_KEY"
+# GOOGLE_API_KEYS = ["YOUR_KEY_1", "YOUR_KEY_2"]
 ```
 
 > Anahtar **asla ekrana basılmaz**, sadece env/secrets üzerinden okunur.

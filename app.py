@@ -40,7 +40,7 @@ from engine.pipeline import apply_choice, apply_option_spec, draft_to_bundle, in
 APP_TITLE = "Startup Survivor RPG"
 APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. (LLM içerik + deterministik ekonomi)"
 APP_VERSION = "3.2.1"
-BUILD_ID = "v11.2-core-bootstrap-20260219"
+BUILD_ID = "v11.5-multi-key-pool-20260222"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
@@ -221,19 +221,97 @@ def _now_id() -> str:
     return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
 
-def _get_api_key() -> str:
-    # Streamlit Cloud: st.secrets
-    if "GEMINI_API_KEY" in st.secrets:
-        return str(st.secrets["GEMINI_API_KEY"])  # type: ignore
-    # Local
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+def _mask_key(k: str) -> str:
+    k = (k or '').strip()
+    if not k:
+        return ''
+    if len(k) <= 8:
+        return '*' * len(k)
+    return f"{k[:4]}…{k[-4:]} (len={len(k)})"
+
+
+def _coerce_key_list(v: Any) -> List[str]:
+    """Accept TOML list, multiline string, or comma-separated string."""
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        out: List[str] = []
+        for x in v:
+            if x is None:
+                continue
+            out.extend(_coerce_key_list(x))
+        return [k for k in out if k]
+
+    s = str(v).strip()
+    if not s:
+        return []
+    # Multiline
+    if "\n" in s:
+        return [ln.strip() for ln in s.splitlines() if ln.strip()]
+    # CSV
+    if "," in s:
+        return [x.strip() for x in s.split(",") if x.strip()]
+    return [s]
+
+
+def _get_api_keys() -> tuple[List[str], str]:
+    """Return (api_keys, source_label).
+
+    Streamlit Community Cloud keeps secrets in st.secrets (NOT env vars).
+    We accept either list or single key for convenience.
+
+    Preferred:
+      - GEMINI_API_KEYS = ["k1", "k2", ...]
+    Also supported:
+      - GEMINI_API_KEY = "k1"  (or "k1,k2,k3")
+      - GOOGLE_API_KEYS / GOOGLE_API_KEY
+    """
+    if hasattr(st, "secrets"):
+        for k in ("GEMINI_API_KEYS", "GOOGLE_API_KEYS"):
+            if k in st.secrets:
+                keys = _coerce_key_list(st.secrets[k])  # type: ignore[index]
+                return keys, f"st.secrets:{k}"
+        for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            if k in st.secrets:
+                keys = _coerce_key_list(st.secrets[k])  # type: ignore[index]
+                return keys, f"st.secrets:{k}"
+
+    env_val = (
+        os.getenv("GEMINI_API_KEYS")
+        or os.getenv("GOOGLE_API_KEYS")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or ""
+    )
+    if env_val:
+        return _coerce_key_list(env_val), "env"
+    return [], "missing"
 
 
 def _provider() -> GeminiProvider:
-    key = _get_api_key()
-    return GeminiProvider.from_api_key_string(key)
+    """Session-cached provider.
 
+    Important: If we created a new provider instance on every call, key rotation
+    would never persist and a key pool would be useless. We therefore keep a
+    provider per Streamlit session and distribute load round-robin.
+    """
+    keys, _src = _get_api_keys()
+    sig = "|".join(keys)
 
+    # Make a session nonce so different users don't all start from key #0.
+    if "_session_nonce" not in st.session_state:
+        st.session_state["_session_nonce"] = os.urandom(8).hex()
+
+    cached_sig = st.session_state.get("_gemini_keys_sig")
+    if st.session_state.get("_gemini_provider") is None or cached_sig != sig:
+        # Pick a deterministic offset per user session to spread traffic.
+        if keys:
+            off = stable_int_seed(f"keypool:{st.session_state['_session_nonce']}") % max(1, len(keys))
+            keys = keys[off:] + keys[:off]
+        st.session_state["_gemini_provider"] = GeminiProvider(keys)
+        st.session_state["_gemini_keys_sig"] = sig
+
+    return st.session_state["_gemini_provider"]
 def _provider_status() -> ProviderStatus:
     try:
         return _provider().status()
@@ -871,6 +949,17 @@ def sidebar() -> str:
     st.sidebar.markdown(f"**{APP_TITLE}**  ")
     st.sidebar.markdown(f"v{APP_VERSION} · {BUILD_ID}")
 
+    # API key diagnostics (masked) + pool info
+    _keys, _src = _get_api_keys()
+    if _keys:
+        current = _keys[0]
+        st.sidebar.caption(f"🔑 Key pool: {len(_keys)} · current: {_mask_key(current)} · source={_src}")
+        if not str(current).strip().startswith("AIza"):
+            st.sidebar.warning("Key formatı alışılmadık görünüyor (genelde 'AIza…'). Yanlış anahtar (OpenAI/Claude vb.) koymuş olabilirsin.")
+        st.sidebar.caption("Pool modu: round-robin + hata olursa diğer key.")
+    else:
+        st.sidebar.warning("🔑 API key bulunamadı. Secrets'e GEMINI_API_KEYS (liste) veya GEMINI_API_KEY ekle.")
+
     st.sidebar.markdown("---")
 
     ss.player_name = st.sidebar.text_input("İsim", value=str(ss.get("player_name", "")))
@@ -946,6 +1035,10 @@ def main() -> None:
             page_run()
         except Exception as e:
             st.error(f"Sistem şu an cevap veremiyor: {e}")
+            if 'API_KEY_INVALID' in str(e) or 'API key not valid' in str(e):
+                st.info(
+                    "API key geçersiz görünüyor. Kontrol listesi: (1) Streamlit Secrets'te doğru anahtar mı? (2) Anahtarda kopyalama sırasında boşluk/newline var mı? (3) Google Cloud API Key restriction (HTTP referrer / IP) açıksa kaldır. (4) Doğru servis: Google AI Studio / Generative Language API anahtarı."
+                )
             st.info("Gemini timeout / API hatası olabilir. Debug sayfasından raw output'a bakabilirsin.")
             # keep bundle None so user can retry by rerun
             ss.current_bundle = None

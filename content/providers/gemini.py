@@ -91,6 +91,33 @@ class GeminiProvider:
         self.api_keys = self.api_keys[1:] + self.api_keys[:1]
         self._init_backend()
 
+    @staticmethod
+    def _err_text(e: Exception) -> str:
+        try:
+            return str(e)
+        except Exception:
+            return repr(e)
+
+    @classmethod
+    def _is_key_invalid(cls, e: Exception) -> bool:
+        s = cls._err_text(e).lower()
+        return (
+            "api_key_invalid" in s
+            or "api key not valid" in s
+            or "invalid api key" in s
+            or "apikey not valid" in s
+        )
+
+    @classmethod
+    def _is_rate_or_quota(cls, e: Exception) -> bool:
+        s = cls._err_text(e).lower()
+        return (
+            "resource_exhausted" in s
+            or "quota" in s
+            or ("rate" in s and "limit" in s)
+            or "429" in s
+        )
+
     def _generate_text(self, prompt: str, temperature: float, max_output_tokens: int) -> str:
         candidates = [
             "gemini-1.5-flash",
@@ -103,6 +130,8 @@ class GeminiProvider:
 
         last_err: Optional[Exception] = None
 
+        # Iterate keys (pool). We rotate on certain errors, and also rotate on success
+        # so that load is distributed across the pool when this provider instance is reused.
         for _ in range(max(1, len(self.api_keys))):
             if self.backend == "genai" and self._client is not None:
                 for m in candidates:
@@ -122,9 +151,14 @@ class GeminiProvider:
                         txt = (getattr(resp, "text", "") or "").strip()
                         if txt:
                             self.model_in_use = m
+                            # Round-robin keys to spread load across pool (session-level).
+                            self._rotate_key()
                             return txt
                     except Exception as e:
                         last_err = e
+                        # If key is invalid or quota is hit, don't waste time trying other models.
+                        if self._is_key_invalid(e) or self._is_rate_or_quota(e):
+                            break
                         continue
 
             if self.backend == "legacy" and self._legacy is not None:
@@ -151,9 +185,12 @@ class GeminiProvider:
                         txt = (getattr(resp, "text", "") or "").strip()
                         if txt:
                             self.model_in_use = m
+                            self._rotate_key()
                             return txt
                     except Exception as e:
                         last_err = e
+                        if self._is_key_invalid(e) or self._is_rate_or_quota(e):
+                            break
                         continue
 
             self._rotate_key()
