@@ -226,6 +226,7 @@ class GeminiProvider:
         2) If parse/validation fails and repair_on_fail is True, run one repair pass.
         """
         raw = self._generate_text(prompt, temperature=temperature, max_output_tokens=max_output_tokens)
+        data: Optional[Dict[str, Any]] = None
         try:
             data = self._parse_or_raise(raw)
             # month_id is supplied by the caller (engine/UI) and validated in draft_from_llm_v1.
@@ -235,6 +236,30 @@ class GeminiProvider:
             return draft, raw
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
+
+            # If JSON parsed but failed validation due to minimum-length/steps,
+            # run an "expand" pass that keeps the same schema but enriches fields.
+            try:
+                msg = str(e)
+            except Exception:
+                msg = ""
+
+            if repair_on_fail and data is not None and ("too short" in msg or "steps must be" in msg):
+                try:
+                    from ..prompts import build_json_expand_prompt
+
+                    canonical = json.dumps(data, ensure_ascii=False, indent=2)
+                    expand_prompt = build_json_expand_prompt(canonical, reason=msg)
+                    raw_expand = self._generate_text(
+                        expand_prompt,
+                        temperature=0.2,
+                        max_output_tokens=max_output_tokens + 500,
+                    )
+                    data_expand = self._parse_or_raise(raw_expand)
+                    draft_expand = draft_from_llm(data_expand, month_id=int(month_id))
+                    return draft_expand, raw_expand
+                except Exception as e2:
+                    self.last_error = f"{type(e2).__name__}: {e2}"
 
         if repair_on_fail:
             from ..prompts import build_json_repair_prompt

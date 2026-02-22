@@ -229,3 +229,30 @@ def build_json_repair_prompt(broken_text: str) -> str:
 BOZUK METİN:
 {broken_text}
 """.strip()
+
+
+def build_json_expand_prompt(json_text: str, reason: str = "") -> str:
+    """Ask the model to expand/complete a *valid* JSON so it passes validation.
+
+    Used when JSON parses but fails our minimum-length / minimum-steps constraints.
+    """
+
+    json_text = str(json_text or "").strip()
+    reason = (reason or "").strip()
+    reason_line = f"- Sebep: {reason}" if reason else ""
+
+    return f"""Aşağıdaki JSON geçerli ama içerik KISA/EKSİK kaldı. Görevin: SADECE geçerli JSON döndürmek.
+
+Kurallar:
+- Markdown yok, açıklama yok, sadece JSON.
+- Alan isimlerini ve şemayı KORU. (month_title, durum_analizi, kriz_title, kriz, options...)
+- 'durum_analizi' ve 'kriz' alanlarını uzat: her biri en az 220 karakter olacak.
+- Her option için steps en az 4 madde olacak (4-6 ideal).
+- options listesi 2 veya 3 adet olsun. id A/B/(opsiyonel C) şeklinde.
+- 'result' alanları 2-4 kısa paragraf olsun (seçilirse ne olur?).
+- tag sadece izinli etiketlerden biri olsun; risk low|med|high.
+{reason_line}
+
+JSON (genişletilecek):
+{json_text}
+""".strip()
